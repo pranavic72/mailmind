@@ -1,55 +1,116 @@
 import { google } from "googleapis";
-import { auth, clerkClient } from "@clerk/nextjs/server";
 
-/**
- * Retrieves the Google OAuth access token for the currently signed-in user
- * (stored by Clerk after the Google OAuth flow) and returns an authenticated
- * Gmail API client.
- *
- * Throws if there is no signed-in user or no Google OAuth token on file.
- */
-export async function getGmailClient() {
-  const { userId } = await auth();
-
-  if (!userId) {
-    throw new Error("Not authenticated");
-  }
-
-  const client = await clerkClient();
-
-  console.log("Attempting to get OAuth token for userId:", userId);
-
-  const tokenResponse = await client.users.getUserOauthAccessToken(
-    userId,
-    "google"
-  );
-
-  console.log("Token response:", tokenResponse);
-  console.log("Token response data:", tokenResponse.data);
-
-  const accessToken = tokenResponse.data?.[0]?.token;
-
-  console.log("Access token extracted:", accessToken ? "YES" : "NO");
-
-  if (!accessToken) {
-    throw new Error(
-      "No Google OAuth access token found for this user. " +
-        "Token response was: " + JSON.stringify(tokenResponse.data)
-    );
-  }
-
-  const oauth2Client = new google.auth.OAuth2();
-  oauth2Client.setCredentials({ access_token: accessToken });
-
-  return google.gmail({ version: "v1", auth: oauth2Client });
+function getGmailClient(accessToken: string) {
+  const auth = new google.auth.OAuth2();
+  auth.setCredentials({ access_token: accessToken });
+  return google.gmail({ version: "v1", auth });
 }
 
-/**
- * Fetches the authenticated user's Gmail profile (email address, message
- * counts, etc). Used as a smoke test that the Gmail scope is working.
- */
-export async function getGmailProfile() {
-  const gmail = await getGmailClient();
-  const res = await gmail.users.getProfile({ userId: "me" });
-  return res.data;
+export interface EmailMessage {
+  id: string;
+  threadId: string;
+  subject: string;
+  sender: string;
+  senderName: string;
+  senderEmail: string;
+  snippet: string;
+  date: string;
+  dateTimestamp: number;
+  isRead: boolean;
+  labelIds: string[];
+}
+
+function extractHeader(
+  headers: { name: string; value: string }[],
+  name: string
+): string {
+  return headers.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value ?? "";
+}
+
+function parseSender(from: string): { name: string; email: string } {
+  // Handles "Name <email>" or just "email"
+  const match = from.match(/^(.*?)\s*<(.+?)>$/);
+  if (match) {
+    return { name: match[1].trim().replace(/^"|"$/g, ""), email: match[2].trim() };
+  }
+  return { name: from.trim(), email: from.trim() };
+}
+
+export async function listMessageIds(
+  accessToken: string,
+  maxResults = 50
+): Promise<{ id: string; threadId: string }[]> {
+  const gmail = getGmailClient(accessToken);
+  const res = await gmail.users.messages.list({
+    userId: "me",
+    labelIds: ["INBOX"],
+    maxResults,
+  });
+  return (res.data.messages ?? []) as { id: string; threadId: string }[];
+}
+
+export async function getMessage(
+  accessToken: string,
+  messageId: string
+): Promise<EmailMessage> {
+  const gmail = getGmailClient(accessToken);
+  const res = await gmail.users.messages.get({
+    userId: "me",
+    id: messageId,
+    format: "metadata",
+    metadataHeaders: ["Subject", "From", "Date"],
+  });
+
+  const msg = res.data;
+  const headers = (msg.payload?.headers ?? []) as { name: string; value: string }[];
+
+  const subject = extractHeader(headers, "Subject") || "(no subject)";
+  const from = extractHeader(headers, "From") || "";
+  const dateHeader = extractHeader(headers, "Date") || "";
+  const { name: senderName, email: senderEmail } = parseSender(from);
+
+  const dateTimestamp = dateHeader ? new Date(dateHeader).getTime() : 0;
+  const isRead = !(msg.labelIds ?? []).includes("UNREAD");
+
+  return {
+    id: msg.id ?? messageId,
+    threadId: msg.threadId ?? "",
+    subject,
+    sender: from,
+    senderName,
+    senderEmail,
+    snippet: msg.snippet ?? "",
+    date: dateHeader,
+    dateTimestamp,
+    isRead,
+    labelIds: msg.labelIds ?? [],
+  };
+}
+
+export async function getMessages(
+  accessToken: string,
+  maxResults = 50
+): Promise<EmailMessage[]> {
+  const ids = await listMessageIds(accessToken, maxResults);
+
+  // Fetch in parallel with concurrency cap to avoid rate limits
+  const CHUNK = 10;
+  const results: EmailMessage[] = [];
+
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const chunk = ids.slice(i, i + CHUNK);
+    const fetched = await Promise.all(
+      chunk.map((m) => getMessage(accessToken, m.id))
+    );
+    results.push(...fetched);
+  }
+
+  // Sort: unread first, then by date descending
+  results.sort((a, b) => {
+    if (!a.isRead && b.isRead) return -1;
+    if (a.isRead && !b.isRead) return 1;
+    return b.dateTimestamp - a.dateTimestamp;
+  });
+
+  return results;
 }
