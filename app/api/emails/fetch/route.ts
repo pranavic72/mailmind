@@ -1,3 +1,4 @@
+//Working Inbox-view API route to fetch emails from Gmail using the access token stored in Clerk. It checks for user authentication, retrieves the Google OAuth access token, and then calls the getMessages function to fetch the emails. The response includes the emails and their count, or an error message if something goes wrong.
 import { auth, clerkClient } from "@clerk/nextjs/server";
 import { NextResponse } from "next/server";
 import { getMessages } from "@/lib/gmail";
